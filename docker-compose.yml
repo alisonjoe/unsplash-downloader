@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  unsplash-downloader:
+    build: .
+    container_name: unsplash-downloader
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      - UNSPLASH_ACCESS_KEY=${UNSPLASH_ACCESS_KEY}
+      - BATCH_SIZE=${BATCH_SIZE:-10}
+      - REQUEST_INTERVAL=${REQUEST_INTERVAL:-60}
+      - DOWNLOAD_INTERVAL=${DOWNLOAD_INTERVAL:-2}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data  # 现在挂载整个 data 目录
+      - ./logs:/app/logs
+    command: download
+
+  db-manager:
+    build: .
+    container_name: unsplash-db-manager
+    profiles: ["tools"]
+    user: "1000:1000"
+    environment:
+      - UNSPLASH_ACCESS_KEY=${UNSPLASH_ACCESS_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: stats
+
