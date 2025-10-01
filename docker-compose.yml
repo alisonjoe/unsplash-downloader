@@ -12,8 +12,10 @@ services:
       - REQUEST_INTERVAL=${REQUEST_INTERVAL:-60}
       - DOWNLOAD_INTERVAL=${DOWNLOAD_INTERVAL:-2}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=Asia/Shanghai
     volumes:
-      - ./data:/app/data  # 现在挂载整个 data 目录
+      - /volume1/e-book/壁纸/素材:/app/data  # 现在挂载整个 data 目录
+      - ./config:/app/config
       - ./logs:/app/logs
     command: download
 
@@ -24,8 +26,8 @@ services:
     user: "1000:1000"
     environment:
       - UNSPLASH_ACCESS_KEY=${UNSPLASH_ACCESS_KEY}
+      - TZ=Asia/Shanghai
     volumes:
-      - ./data:/app/data
+      - /volume1/e-book/壁纸/素材:/app/data  # 现在挂载整个 data 目录
+      - ./config:/app/config
       - ./logs:/app/logs
-    command: stats
-
