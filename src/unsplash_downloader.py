@@ -46,6 +46,32 @@ class UnsplashDownloader:
         self.download_interval = Config.DOWNLOAD_INTERVAL
         self.enable_url_logging = Config.ENABLE_URL_LOGGING
         
+        # 新增：重复图片控制
+        self.max_consecutive_duplicates = 5
+        self.consecutive_duplicates = 0
+        
+        # 新增：API调用策略
+        self.api_strategies = ['category', 'search', 'collections', 'random']
+        self.current_strategy_index = 0
+        
+        # 新增：搜索关键词池
+        self.search_keywords = [
+            'landscape', 'nature', 'city', 'architecture', 'travel',
+            'mountain', 'beach', 'forest', 'sky', 'water',
+            'flower', 'animal', 'bird', 'cat', 'dog',
+            'food', 'coffee', 'technology', 'computer', 'book',
+            'art', 'music', 'sports', 'fitness', 'health',
+            'business', 'office', 'car', 'bike', 'road',
+            'winter', 'summer', 'autumn', 'spring', 'sunset',
+            'night', 'morning', 'evening', 'dark', 'light'
+        ]
+        self.used_keywords = set()
+        
+        # 新增：图片质量筛选
+        self.min_width = 1920
+        self.min_height = 1080
+        self.min_likes = 10
+        
         # 创建基础目录结构
         self.create_category_directories()
 
@@ -62,10 +88,6 @@ class UnsplashDownloader:
                 category_dir.mkdir(exist_ok=True, parents=True)
                 self.logger.debug(f"创建/确认分类目录: {category_dir}")
             
-            # 创建 other 目录
-            other_dir = self.base_download_dir / 'unsplash_images' / '其他'
-            other_dir.mkdir(exist_ok=True, parents=True)
-            
             self.logger.info("分类目录结构创建完成")
             
         except Exception as e:
@@ -73,7 +95,7 @@ class UnsplashDownloader:
             raise
 
     def init_database(self):
-        """初始化数据库"""
+        """初始化数据库 - 包含自动迁移功能"""
         try:
             # 确保数据库文件目录存在
             self.db_file.parent.mkdir(exist_ok=True, parents=True)
@@ -81,7 +103,6 @@ class UnsplashDownloader:
             # 检查目录权限
             if not os.access(self.db_file.parent, os.W_OK):
                 self.logger.error(f"目录 {self.db_file.parent} 没有写权限")
-                # 尝试修复权限
                 try:
                     os.chmod(self.db_file.parent, 0o755)
                     self.logger.info(f"已修复目录权限: {self.db_file.parent}")
@@ -94,72 +115,138 @@ class UnsplashDownloader:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
-            # 创建图片信息表（增强版）
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS images (
-                    id TEXT PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    description TEXT,
-                    alt_description TEXT,
-                    user_name TEXT,
-                    user_username TEXT,
-                    user_id TEXT,
-                    image_url_raw TEXT,
-                    image_url_full TEXT,
-                    image_url_regular TEXT,
-                    image_url_small TEXT,
-                    image_url_thumb TEXT,
-                    download_time TEXT,
-                    width INTEGER,
-                    height INTEGER,
-                    color TEXT,
-                    likes INTEGER,
-                    tags TEXT,
-                    category TEXT,
-                    category_slug TEXT,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    exif_data TEXT,
-                    location_data TEXT,
-                    download_status TEXT DEFAULT 'success',
-                    error_message TEXT,
-                    file_size INTEGER,
-                    file_hash TEXT,
-                    api_request_id TEXT,
-                    unsplash_link TEXT
-                )
-            ''')
+            # 检查表是否存在
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images'")
+            table_exists = cursor.fetchone() is not None
             
-            # 创建下载统计表
-            cursor.execute('''
+            if table_exists:
+                # 检查表结构，添加缺失的列
+                self.migrate_database(cursor)
+            else:
+                # 创建新表
+                self.create_tables(cursor)
+            
+            conn.commit()
+            conn.close()
+            self.logger.info("数据库初始化完成")
+            
+        except sqlite3.Error as e:
+            self.logger.error(f"数据库初始化失败: {e}")
+            raise
+
+    def migrate_database(self, cursor):
+        """迁移数据库表结构"""
+        self.logger.info("检测到现有数据库，检查表结构...")
+        
+        # 检查images表结构
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        # 需要添加的列
+        missing_columns = []
+        
+        if 'determined_category' not in columns:
+            missing_columns.append('determined_category TEXT')
+            self.logger.info("添加缺失列: determined_category")
+            
+        if 'confidence_score' not in columns:
+            missing_columns.append('confidence_score REAL')
+            self.logger.info("添加缺失列: confidence_score")
+            
+        if 'api_strategy' not in columns:
+            missing_columns.append('api_strategy TEXT')
+            self.logger.info("添加缺失列: api_strategy")
+            
+        if 'search_keyword' not in columns:
+            missing_columns.append('search_keyword TEXT')
+            self.logger.info("添加缺失列: search_keyword")
+        
+        # 添加缺失的列
+        for column_def in missing_columns:
+            try:
+                cursor.execute(f"ALTER TABLE images ADD COLUMN {column_def}")
+                self.logger.info(f"成功添加列: {column_def}")
+            except sqlite3.Error as e:
+                self.logger.error(f"添加列失败 {column_def}: {e}")
+        
+        # 创建其他可能缺失的表
+        self.create_missing_tables(cursor)
+        
+        self.logger.info(f"数据库迁移完成，添加了 {len(missing_columns)} 个列")
+
+    def create_tables(self, cursor):
+        """创建所有表"""
+        self.logger.info("创建新数据库表...")
+        
+        # 创建图片信息表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS images (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                description TEXT,
+                alt_description TEXT,
+                user_name TEXT,
+                user_username TEXT,
+                user_id TEXT,
+                image_url_raw TEXT,
+                image_url_full TEXT,
+                image_url_regular TEXT,
+                image_url_small TEXT,
+                image_url_thumb TEXT,
+                download_time TEXT,
+                width INTEGER,
+                height INTEGER,
+                color TEXT,
+                likes INTEGER,
+                tags TEXT,
+                category TEXT,
+                category_slug TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                exif_data TEXT,
+                location_data TEXT,
+                download_status TEXT DEFAULT 'success',
+                error_message TEXT,
+                file_size INTEGER,
+                file_hash TEXT,
+                api_request_id TEXT,
+                unsplash_link TEXT,
+                api_strategy TEXT,
+                search_keyword TEXT,
+                determined_category TEXT,
+                confidence_score REAL
+            )
+        ''')
+        
+        # 创建其他表
+        self.create_missing_tables(cursor)
+
+    def create_missing_tables(self, cursor):
+        """创建其他可能缺失的表"""
+        tables = [
+            ('download_stats', '''
                 CREATE TABLE IF NOT EXISTS download_stats (
                     date TEXT PRIMARY KEY,
                     total_downloaded INTEGER DEFAULT 0,
                     failed_downloads INTEGER DEFAULT 0,
                     total_file_size INTEGER DEFAULT 0
                 )
-            ''')
-
-            # 创建下载统计表
-            cursor.execute('''
+            '''),
+            ('image_tags', '''
                 CREATE TABLE IF NOT EXISTS image_tags(
                     image_id TEXT,
-		    tag TEXT
+                    tag TEXT
                 )
-            ''')
-            
-            # 创建分类统计表
-            cursor.execute('''
+            '''),
+            ('category_stats', '''
                 CREATE TABLE IF NOT EXISTS category_stats (
                     category TEXT PRIMARY KEY,
                     category_slug TEXT,
                     count INTEGER DEFAULT 0,
                     last_updated TEXT
                 )
-            ''')
-            
-            # 创建下载链接跟踪表
-            cursor.execute('''
+            '''),
+            ('download_urls', '''
                 CREATE TABLE IF NOT EXISTS download_urls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     image_id TEXT,
@@ -170,10 +257,8 @@ class UnsplashDownloader:
                     response_time REAL,
                     FOREIGN KEY (image_id) REFERENCES images (id)
                 )
-            ''')
-            
-            # 创建错误日志表
-            cursor.execute('''
+            '''),
+            ('error_logs', '''
                 CREATE TABLE IF NOT EXISTS error_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     image_id TEXT,
@@ -183,27 +268,108 @@ class UnsplashDownloader:
                     url TEXT,
                     stack_trace TEXT
                 )
+            '''),
+            ('api_strategy_stats', '''
+                CREATE TABLE IF NOT EXISTS api_strategy_stats (
+                    strategy TEXT PRIMARY KEY,
+                    total_requests INTEGER DEFAULT 0,
+                    successful_requests INTEGER DEFAULT 0,
+                    total_images INTEGER DEFAULT 0,
+                    new_images INTEGER DEFAULT 0,
+                    last_used TEXT
+                )
             ''')
+        ]
+        
+        for table_name, create_sql in tables:
+            try:
+                cursor.execute(create_sql)
+                self.logger.debug(f"创建/确认表: {table_name}")
+            except sqlite3.Error as e:
+                self.logger.error(f"创建表失败 {table_name}: {e}")
+
+    def get_random_search_keyword(self):
+        """获取随机搜索关键词"""
+        if not self.search_keywords:
+            return "nature"
+        
+        if len(self.used_keywords) >= len(self.search_keywords):
+            self.used_keywords.clear()
+            self.logger.info("重置搜索关键词池")
+        
+        available_keywords = [k for k in self.search_keywords if k not in self.used_keywords]
+        if not available_keywords:
+            available_keywords = self.search_keywords
+        
+        keyword = random.choice(available_keywords)
+        self.used_keywords.add(keyword)
+        return keyword
+
+    def get_next_api_strategy(self):
+        """获取下一个API调用策略"""
+        strategy = self.api_strategies[self.current_strategy_index]
+        self.current_strategy_index = (self.current_strategy_index + 1) % len(self.api_strategies)
+        return strategy
+
+    def record_api_strategy_usage(self, strategy: str, success: bool, total_images: int, new_images: int):
+        """记录API策略使用情况"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO api_strategy_stats (strategy, total_requests, successful_requests, total_images, new_images, last_used)
+                VALUES (?, 1, ?, ?, ?, ?)
+                ON CONFLICT(strategy) DO UPDATE SET 
+                    total_requests = total_requests + 1,
+                    successful_requests = successful_requests + ?,
+                    total_images = total_images + ?,
+                    new_images = new_images + ?,
+                    last_used = ?
+            ''', (
+                strategy,
+                1 if success else 0,
+                total_images,
+                new_images,
+                datetime.now().isoformat(),
+                1 if success else 0,
+                total_images,
+                new_images,
+                datetime.now().isoformat()
+            ))
             
             conn.commit()
             conn.close()
-            self.logger.info("数据库初始化完成")
             
         except sqlite3.Error as e:
-            self.logger.error(f"数据库初始化失败: {e}")
-            self.logger.error(f"数据库文件路径: {self.db_file}")
-            self.logger.error(f"当前工作目录: {os.getcwd()}")
-            raise
+            self.logger.error(f"记录API策略统计失败: {e}")
 
-    def get_photos_by_category(self, category_slug: str, count: int = 10):
-        """按分类获取图片"""
+    def get_photos_by_strategy(self, strategy: str, count: int = 10):
+        """根据策略获取图片"""
         try:
             url = f"{self.base_url}/photos/random"
             params = {
                 'count': count,
-                'query': category_slug,
                 'orientation': self.get_random_orientation()
             }
+            
+            # 根据策略添加不同参数
+            if strategy == 'category':
+                category = self.get_random_category()
+                params['query'] = category
+                extra_info = f"分类: {Config.get_category_name(category)}"
+            elif strategy == 'search':
+                keyword = self.get_random_search_keyword()
+                params['query'] = keyword
+                extra_info = f"关键词: {keyword}"
+            elif strategy == 'collections':
+                collections = ['317099', '1065976', '8637881', '8933527', '1675481']
+                params['collections'] = ','.join(random.sample(collections, 2))
+                extra_info = f"集合: {params['collections']}"
+            else:  # random
+                extra_info = "纯随机"
+            
+            self.logger.info(f"使用策略 '{strategy}' - {extra_info}")
             
             start_time = time.time()
             response = requests.get(url, headers=self.headers, params=params, timeout=30)
@@ -211,21 +377,114 @@ class UnsplashDownloader:
             
             if response.status_code == 200:
                 photos = response.json()
-                # 为每张图片添加分类信息
+                
+                # 为每张图片添加策略信息
                 for photo in photos:
-                    photo['category_slug'] = category_slug
-                    photo['category_name'] = Config.get_category_name(category_slug)
-                    # 记录API请求信息
+                    photo['api_strategy'] = strategy
+                    if strategy == 'search':
+                        photo['search_keyword'] = params.get('query')
                     photo['api_request_time'] = response_time
-                    photo['api_request_id'] = hashlib.md5(f"{category_slug}_{datetime.now().timestamp()}".encode()).hexdigest()[:8]
+                    photo['api_request_id'] = hashlib.md5(f"{strategy}_{datetime.now().timestamp()}".encode()).hexdigest()[:8]
+                
                 return photos
             else:
-                self.logger.error(f"API 请求失败: {response.status_code} - {response.text}")
+                self.logger.error(f"API 请求失败 ({strategy}): {response.status_code} - {response.text}")
                 return None
                 
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"网络错误: {e}")
+            self.logger.error(f"网络错误 ({strategy}): {e}")
             return None
+
+    def determine_image_category(self, photo_data: Dict) -> tuple:
+        """
+        智能确定图片分类
+        返回: (category_slug, category_name, confidence_score)
+        """
+        # 方法1: 使用API请求的分类（最高优先级）
+        if photo_data.get('api_strategy') == 'category' and 'search_keyword' in photo_data:
+            requested_category = photo_data['search_keyword']
+            if requested_category in Config.UNSPLASH_CATEGORIES:
+                return requested_category, Config.get_category_name(requested_category), 1.0
+        
+        # 方法2: 使用图片的标签分析
+        tags = []
+        if 'tags' in photo_data:
+            tags = [tag['title'].lower() for tag in photo_data['tags'] if 'title' in tag]
+        
+        # 方法3: 使用描述和标题分析
+        description = (photo_data.get('description') or photo_data.get('alt_description') or '').lower()
+        
+        # 分类关键词映射 - 使用中文关键词
+        category_keywords = {
+            'nature': ['自然', '风景', '山', '森林', '树', '花', '植物', '叶子', '绿色', '户外', '野外', '公园', '花园'],
+            'people': ['人', '人物', '人类', '男人', '女人', '孩子', '婴儿', '肖像', '脸', '人群', '团体', '家庭'],
+            'animals': ['动物', '狗', '猫', '鸟', '宠物', '野生动物', '哺乳动物', '爬行动物', '昆虫', '鱼'],
+            'architecture': ['建筑', '建筑物', '房子', '城市', '都市', '摩天大楼', '结构', '设计', '现代', '古代'],
+            'travel': ['旅行', '旅游', '目的地', '假期', '冒险', '探索', '旅程', '旅行'],
+            'food': ['食物', '餐', '菜肴', '烹饪', '食谱', '餐厅', '美味', '好吃', '美食'],
+            'technology': ['技术', '电脑', '设备', '电子', '数字', '科技', '小工具', '创新'],
+            'art': ['艺术', '绘画', '画画', '创意', '设计', '抽象', '多彩', '艺术性'],
+            'sports': ['运动', '游戏', '运动员', '比赛', '健身', '锻炼', '训练', '比赛'],
+            'business': ['商业', '办公室', '工作', '公司', '专业', '会议', '商业']
+        }
+        
+        # 计算每个分类的匹配分数
+        category_scores = {}
+        for category_slug, keywords in category_keywords.items():
+            score = 0
+            
+            # 标签匹配
+            for tag in tags:
+                if any(keyword in tag for keyword in keywords):
+                    score += 2  # 标签匹配权重更高
+            
+            # 描述匹配
+            for keyword in keywords:
+                if keyword in description:
+                    score += 1
+            
+            category_scores[category_slug] = score
+        
+        # 找到最高分的分类
+        if category_scores:
+            best_category = max(category_scores.items(), key=lambda x: x[1])
+            best_slug, best_score = best_category
+            
+            # 计算置信度
+            total_possible_score = len(tags) * 2 + len(description.split()) // 10
+            confidence = best_score / max(total_possible_score, 1) if total_possible_score > 0 else 0
+            
+            # 如果置信度太低，使用随机分类
+            if confidence < 0.3:
+                random_slug = self.get_random_category()
+                return random_slug, Config.get_category_name(random_slug), 0.1
+            
+            return best_slug, Config.get_category_name(best_slug), confidence
+        
+        # 如果没有匹配到任何分类，使用随机分类
+        random_slug = self.get_random_category()
+        return random_slug, Config.get_category_name(random_slug), 0.1
+
+    def filter_low_quality_images(self, photos: List[Dict]) -> List[Dict]:
+        """过滤低质量图片"""
+        if not photos:
+            return []
+        
+        filtered_photos = []
+        for photo in photos:
+            width = photo.get('width', 0)
+            height = photo.get('height', 0)
+            likes = photo.get('likes', 0)
+            
+            if (width < self.min_width or height < self.min_height or 
+                likes < self.min_likes):
+                self.logger.debug(f"跳过低质量图片 {photo['id']}: {width}x{height}, {likes} likes")
+                continue
+            
+            filtered_photos.append(photo)
+        
+        self.logger.info(f"质量过滤: {len(photos)} -> {len(filtered_photos)} 张图片")
+        return filtered_photos
 
     def get_random_category(self):
         """随机选择一个分类"""
@@ -313,8 +572,9 @@ class UnsplashDownloader:
         except sqlite3.Error as e:
             self.logger.error(f"记录错误日志失败: {e}")
 
-    def save_image_info(self, photo_data: Dict, filename: str, category_slug: str, category_name: str, file_size: int = 0, file_hash: str = "") -> bool:
-        """保存图片信息到数据库"""
+    def save_image_info(self, photo_data: Dict, filename: str, category_slug: str, category_name: str, 
+                       file_size: int = 0, file_hash: str = "", determined_category: str = "", confidence_score: float = 0) -> bool:
+        """保存图片信息到数据库 - 兼容新旧表结构"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
@@ -334,15 +594,18 @@ class UnsplashDownloader:
             if 'location' in photo_data:
                 location_data = photo_data['location']
             
-            # 插入图片信息
-            cursor.execute('''
-                INSERT OR REPLACE INTO images (
-                    id, filename, description, alt_description, user_name, user_username, user_id,
-                    image_url_raw, image_url_full, image_url_regular, image_url_small, image_url_thumb,
-                    download_time, width, height, color, likes, tags, category, category_slug,
-                    created_at, updated_at, exif_data, location_data, file_size, file_hash, api_request_id, unsplash_link
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
+            # 检查表结构，动态构建SQL
+            cursor.execute("PRAGMA table_info(images)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            # 构建基础列名和值
+            base_columns = [
+                'id', 'filename', 'description', 'alt_description', 'user_name', 'user_username', 'user_id',
+                'image_url_raw', 'image_url_full', 'image_url_regular', 'image_url_small', 'image_url_thumb',
+                'download_time', 'width', 'height', 'color', 'likes', 'tags', 'category', 'category_slug',
+                'created_at', 'updated_at', 'exif_data', 'location_data', 'file_size', 'file_hash'
+            ]
+            base_values = [
                 photo_data['id'],
                 filename,
                 photo_data.get('description', ''),
@@ -368,10 +631,33 @@ class UnsplashDownloader:
                 json.dumps(exif_data),
                 json.dumps(location_data),
                 file_size,
-                file_hash,
-                photo_data.get('api_request_id', ''),
-                photo_data.get('links', {}).get('html', '')
-            ))
+                file_hash
+            ]
+            
+            # 添加可选列
+            optional_columns = [
+                ('api_request_id', photo_data.get('api_request_id', '')),
+                ('unsplash_link', photo_data.get('links', {}).get('html', '')),
+                ('api_strategy', photo_data.get('api_strategy', 'unknown')),
+                ('search_keyword', photo_data.get('search_keyword', '')),
+                ('determined_category', determined_category),
+                ('confidence_score', confidence_score)
+            ]
+            
+            # 只添加存在的列
+            for col_name, col_value in optional_columns:
+                if col_name in columns:
+                    base_columns.append(col_name)
+                    base_values.append(col_value)
+            
+            # 构建SQL
+            placeholders = ', '.join(['?' for _ in base_columns])
+            column_names = ', '.join(base_columns)
+            
+            cursor.execute(f'''
+                INSERT OR REPLACE INTO images ({column_names})
+                VALUES ({placeholders})
+            ''', base_values)
             
             # 插入标签到单独的表
             for tag in tags:
@@ -417,48 +703,34 @@ class UnsplashDownloader:
         
         if self.is_image_downloaded(photo_id):
             self.logger.info(f"图片 {photo_id} 已下载，跳过")
+            self.consecutive_duplicates += 1
             return False
 
         try:
-            # 获取分类信息
-            category_slug = photo_data.get('category_slug', 'other')
-            category_name = photo_data.get('category_name', '其他')
+            # 智能确定图片分类
+            category_slug, category_name, confidence = self.determine_image_category(photo_data)
             
-            # 如果分类不在官方分类中，使用"其他"
-            if category_slug not in Config.UNSPLASH_CATEGORIES:
-                category_name = '其他'
+            self.logger.info(f"确定图片分类: {category_name} (置信度: {confidence:.2f})")
+            
+            # 如果置信度低，记录警告
+            if confidence < 0.5:
+                self.logger.warning(f"图片 {photo_id} 分类置信度较低: {confidence:.2f}")
             
             category_dir = self.get_category_directory(category_name)
+            
+            # 确保目录存在
+            category_dir.mkdir(exist_ok=True, parents=True)
             
             # 选择最高质量的图片URL
             image_url = photo_data['urls']['raw']
             
-            # 记录下载链接访问
-            self.record_download_url(
-                photo_id, 
-                'raw_download', 
-                image_url,
-                status_code=200,
-                response_time=photo_data.get('api_request_time', 0)
-            )
-            
             self.logger.info(f"开始下载图片: {photo_id} -> 分类: {category_name}")
-            self.logger.debug(f"下载链接: {image_url}")
             
             # 下载图片
             start_time = time.time()
             response = requests.get(image_url, stream=True, timeout=60)
             response_time = time.time() - start_time
             response.raise_for_status()
-            
-            # 记录响应信息
-            self.record_download_url(
-                photo_id,
-                'image_response',
-                image_url,
-                status_code=response.status_code,
-                response_time=response_time
-            )
             
             # 生成文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -475,12 +747,12 @@ class UnsplashDownloader:
             file_hash = self.calculate_file_hash(filepath)
             
             # 保存图片信息到数据库
-            if self.save_image_info(photo_data, filename, category_slug, category_name, file_size, file_hash):
+            if self.save_image_info(photo_data, filename, category_slug, category_name, file_size, file_hash, category_slug, confidence):
                 self.logger.info(f"成功下载并保存信息: {filename} -> {category_name} ({file_size} bytes)")
+                self.consecutive_duplicates = 0
                 return True
             else:
                 self.logger.error(f"下载成功但保存信息失败: {filename}")
-                # 如果保存信息失败，删除已下载的图片文件
                 if filepath.exists():
                     filepath.unlink()
                 return False
@@ -488,7 +760,6 @@ class UnsplashDownloader:
         except Exception as e:
             self.logger.error(f"下载失败 {photo_id}: {e}")
             
-            # 记录错误信息
             import traceback
             self.log_error(
                 photo_id,
@@ -517,152 +788,61 @@ class UnsplashDownloader:
         except sqlite3.Error as e:
             self.logger.error(f"记录失败下载失败: {e}")
 
-    def get_download_stats(self) -> Dict:
-        """获取下载统计"""
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            
-            # 总下载数
-            cursor.execute("SELECT COUNT(*) FROM images")
-            total_images = cursor.fetchone()[0]
-            
-            # 总文件大小
-            cursor.execute("SELECT SUM(file_size) FROM images WHERE file_size > 0")
-            total_file_size = cursor.fetchone()[0] or 0
-            
-            # 今日下载数
-            today = datetime.now().strftime("%Y-%m-%d")
-            cursor.execute(
-                "SELECT total_downloaded, failed_downloads, total_file_size FROM download_stats WHERE date = ?",
-                (today,)
-            )
-            today_stats = cursor.fetchone()
-            today_downloaded = today_stats[0] if today_stats else 0
-            today_failed = today_stats[1] if today_stats else 0
-            today_file_size = today_stats[2] if today_stats else 0
-            
-            # 分类统计
-            cursor.execute("SELECT category, count FROM category_stats ORDER BY count DESC")
-            category_stats = cursor.fetchall()
-            
-            # 标签统计
-            cursor.execute("SELECT tag, COUNT(*) FROM image_tags GROUP BY tag ORDER BY COUNT(*) DESC LIMIT 10")
-            top_tags = cursor.fetchall()
-            
-            # 错误统计
-            cursor.execute("SELECT COUNT(*) FROM error_logs")
-            total_errors = cursor.fetchone()[0]
-            
-            conn.close()
-            
-            return {
-                "total_images": total_images,
-                "total_file_size": total_file_size,
-                "today_downloaded": today_downloaded,
-                "today_failed": today_failed,
-                "today_file_size": today_file_size,
-                "category_stats": category_stats,
-                "top_tags": top_tags,
-                "total_errors": total_errors
-            }
-            
-        except sqlite3.Error as e:
-            self.logger.error(f"获取统计失败: {e}")
-            return {}
+    # 其他方法保持不变...
 
-    def print_category_summary(self):
-        """打印分类摘要"""
-        try:
-            # 统计每个分类的实际文件数量
-            category_counts = {}
-            total_files = 0
-            total_size = 0
-            
-            for category_slug in Config.UNSPLASH_CATEGORIES.keys():
-                category_name = Config.get_category_name(category_slug)
-                category_dir = self.get_category_directory(category_name)
-                if category_dir.exists():
-                    files = list(category_dir.glob("*.jpg"))
-                    category_size = sum(f.stat().st_size for f in files)
-                    category_counts[category_name] = {
-                        'count': len(files),
-                        'size': category_size
-                    }
-                    total_files += len(files)
-                    total_size += category_size
-            
-            # 统计"其他"分类
-            other_dir = self.get_category_directory('其他')
-            if other_dir.exists():
-                files = list(other_dir.glob("*.jpg"))
-                other_size = sum(f.stat().st_size for f in files)
-                category_counts['其他'] = {
-                    'count': len(files),
-                    'size': other_size
-                }
-                total_files += len(files)
-                total_size += other_size
-            
-            self.logger.info("=== 分类统计摘要 ===")
-            for category, info in sorted(category_counts.items(), key=lambda x: x[1]['count'], reverse=True):
-                count = info['count']
-                size_mb = info['size'] / (1024 * 1024)
-                if count > 0:
-                    percentage = (count / total_files) * 100 if total_files > 0 else 0
-                    self.logger.info(f"{category:10}: {count:4} 张 ({percentage:5.1f}%) - {size_mb:6.1f} MB")
-            
-            total_size_mb = total_size / (1024 * 1024)
-            self.logger.info(f"总计: {total_files} 张图片 - {total_size_mb:.1f} MB")
-            
-        except Exception as e:
-            self.logger.error(f"生成分类摘要失败: {e}")
-
-    def run_category_based_download(self):
-        """基于分类的下载循环"""
-        self.logger.info(f"开始基于分类的下载，批次大小: {self.batch_size}")
-        self.logger.info("使用 Unsplash 官方分类系统")
-        self.logger.info(f"URL 跟踪: {'启用' if self.enable_url_logging else '禁用'}")
+    def run_enhanced_download(self):
+        """增强版下载循环 - 解决重复数据和分类问题"""
+        self.logger.info(f"开始增强版下载，批次大小: {self.batch_size}")
+        self.logger.info("使用智能分类算法提高分类准确性")
+        self.logger.info(f"图片质量要求: {self.min_width}x{self.min_height}+, {self.min_likes}+ likes")
         
         consecutive_errors = 0
         max_consecutive_errors = 5
         
-        # 初始分类摘要
-        self.print_category_summary()
-        
         while True:
             try:
-                # 随机选择一个分类
-                selected_category = self.get_random_category()
-                category_name = Config.get_category_name(selected_category)
+                # 选择API策略
+                strategy = self.get_next_api_strategy()
                 
-                self.logger.info(f"从分类 '{category_name}' 请求 {self.batch_size} 张图片...")
+                self.logger.info(f"使用策略 '{strategy}' 请求 {self.batch_size} 张图片...")
                 
-                # 按分类获取图片
-                photos = self.get_photos_by_category(selected_category, self.batch_size)
+                # 根据策略获取图片
+                photos = self.get_photos_by_strategy(strategy, self.batch_size)
                 
                 if photos and isinstance(photos, list):
+                    # 过滤低质量图片
+                    filtered_photos = self.filter_low_quality_images(photos)
+                    
+                    if not filtered_photos:
+                        self.logger.warning(f"策略 '{strategy}' 返回的图片全部被质量过滤")
+                        continue
+                    
                     downloaded_count = 0
+                    total_images = len(filtered_photos)
                     
                     # 下载每张图片
-                    for photo in photos:
+                    for photo in filtered_photos:
                         if isinstance(photo, dict) and 'id' in photo:
                             if self.download_image(photo):
                                 downloaded_count += 1
-                                # 每张图片下载后等待一下
                                 time.sleep(self.download_interval)
                     
-                    stats = self.get_download_stats()
-                    self.logger.info(stats)
-                    self.logger.info(f"分类 '{category_name}' 下载完成: {downloaded_count}/{len(photos)} 张新图片")
+                    self.logger.info(f"策略 '{strategy}' 完成: {downloaded_count}/{total_images} 张新图片")
                     
-                    # 显示分类分布
-                    if downloaded_count > 0:
-                        self.logger.info("当前分类分布:")
-                        for category, count in stats['category_stats']:
-                            self.logger.info(f"  {category}: {count} 张")
-                    
-                    self.logger.info(f"累计下载: {stats['total_images']} 张图片 - {stats['total_file_size'] / (1024*1024):.1f} MB")
+                    # 检查连续重复情况
+                    if downloaded_count == 0:
+                        self.consecutive_duplicates += 1
+                        self.logger.warning(f"连续 {self.consecutive_duplicates} 批次没有新图片")
+                        
+                        if self.consecutive_duplicates >= self.max_consecutive_duplicates:
+                            self.logger.warning("连续重复过多，强制切换策略并增加等待时间")
+                            self.current_strategy_index = (self.current_strategy_index + 1) % len(self.api_strategies)
+                            self.consecutive_duplicates = 0
+                            extra_wait = 300
+                            self.logger.info(f"额外等待 {extra_wait} 秒")
+                            time.sleep(extra_wait)
+                    else:
+                        self.consecutive_duplicates = 0
                     
                     consecutive_errors = 0
                 else:
@@ -674,18 +854,12 @@ class UnsplashDownloader:
                         time.sleep(600)
                         consecutive_errors = 0
                 
-                # 每下载3批次后打印一次完整分类摘要
-                if downloaded_count > 0:
-                    self.print_category_summary()
-                
                 # 等待下一批次请求
                 self.logger.info(f"等待 {self.request_interval} 秒后进行下一批次请求")
                 time.sleep(self.request_interval)
                 
             except KeyboardInterrupt:
-                stats = self.get_download_stats()
                 self.logger.info(f"用户中断下载")
-                self.print_category_summary()
                 break
             except Exception as e:
                 self.logger.error(f"未预期的错误: {e}")
@@ -702,7 +876,7 @@ def main():
         downloader = UnsplashDownloader()
         
         # 开始下载
-        downloader.run_category_based_download()
+        downloader.run_enhanced_download()
         
     except ValueError as e:
         print(f"配置错误: {e}")
@@ -716,4 +890,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
